@@ -1,0 +1,287 @@
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include <util/atomic.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+#define ADC_MIN            100
+#define ADC_MAX            900
+#define ADC_FALHA_BAIXO     50
+#define ADC_FALHA_ALTO     980
+
+#define NIVEL_LIGA_PADRAO   30
+#define NIVEL_DESLIGA_PADRAO 80
+
+#define NIVEL_CRIT_BAIXO    10
+#define NIVEL_CRIT_ALTO     95
+#define TIMEOUT_BOMBA_S     30
+#define SUBIDA_MIN_PCT       2
+
+#define PIN_BOMBA   PB0
+#define PIN_ALARME  PB1
+
+#define ALM_BAIXO   0x01
+#define ALM_ALTO    0x02
+#define ALM_SENSOR  0x04
+#define ALM_ABAST   0x08
+
+static volatile uint8_t  flag_tick = 0;
+static volatile uint8_t  flag_adc  = 0;
+static volatile uint16_t adc_val   = 0;
+static volatile uint8_t  cmd_ready = 0;
+static volatile char     cmd_buf[16];
+static volatile uint8_t  cmd_idx   = 0;
+
+static int16_t  nivel          = 0;
+static int16_t  nivel_liga     = NIVEL_LIGA_PADRAO;
+static int16_t  nivel_desliga  = NIVEL_DESLIGA_PADRAO;
+static uint8_t  bomba          = 0;
+static uint8_t  modo_auto      = 1;
+static uint8_t  bomba_manual   = 0;
+static uint8_t  alarmes        = 0;
+static uint8_t  alarmes_ant    = 0;
+static uint16_t pump_ticks     = 0;
+static int16_t  nivel_ref      = 0;
+static uint8_t  status_ticks   = 0;
+static uint16_t adc_local      = 0;
+
+static void uart_putc(char c)
+{
+    while (!(UCSR0A & (1 << UDRE0)));
+    UDR0 = c;
+}
+
+static void uart_puts(const char *s)
+{
+    while (*s) uart_putc(*s++);
+}
+
+static void uart_init(void)
+{
+    UBRR0H = 0;
+    UBRR0L = 103;
+    UCSR0B = (1 << RXEN0) | (1 << TXEN0) | (1 << RXCIE0);
+    UCSR0C = (1 << UCSZ01) | (1 << UCSZ00);
+}
+
+static void gpio_init(void)
+{
+    DDRB |= (1 << PIN_BOMBA) | (1 << PIN_ALARME);
+    PORTB &= ~((1 << PIN_BOMBA) | (1 << PIN_ALARME));
+}
+
+static void timer1_init(void)
+{
+    TCCR1A = 0;
+    TCCR1B = (1 << WGM12) | (1 << CS11) | (1 << CS10);
+    OCR1A  = 24999;
+    TIMSK1 = (1 << OCIE1A);
+}
+
+static void adc_init(void)
+{
+    ADMUX  = (1 << REFS0);
+    ADCSRA = (1 << ADEN) | (1 << ADIE) |
+             (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0);
+}
+
+ISR(TIMER1_COMPA_vect)
+{
+    flag_tick = 1;
+    ADCSRA |= (1 << ADSC);
+}
+
+ISR(ADC_vect)
+{
+    adc_val = ADC;
+    flag_adc = 1;
+}
+
+ISR(USART_RX_vect)
+{
+    char c = UDR0;
+
+    if (cmd_ready) return;
+
+    if (c == '\r' || c == '\n') {
+        if (cmd_idx > 0) {
+            cmd_buf[cmd_idx] = '\0';
+            cmd_idx = 0;
+            cmd_ready = 1;
+        }
+    } else if (cmd_idx < sizeof(cmd_buf) - 1) {
+        cmd_buf[cmd_idx++] = toupper((unsigned char)c);
+    }
+}
+
+static void aplica_saidas(void)
+{
+    if (bomba)   PORTB |=  (1 << PIN_BOMBA);  else PORTB &= ~(1 << PIN_BOMBA);
+    if (alarmes) PORTB |=  (1 << PIN_ALARME); else PORTB &= ~(1 << PIN_ALARME);
+}
+
+static void imprime_status(void)
+{
+    char buf[80];
+    snprintf(buf, sizeof(buf), "N=%d%% ADC=%u BOMBA=%u MODO=%c ALM=0x%02X ON=%d OFF=%d\r\n",
+             nivel, adc_local, bomba, modo_auto ? 'A' : 'M', alarmes,
+             nivel_liga, nivel_desliga);
+    uart_puts(buf);
+}
+
+static void informa_alarmes(void)
+{
+    if (alarmes == alarmes_ant) return;
+
+    uint8_t novos = alarmes & ~alarmes_ant;
+    if (novos & ALM_BAIXO)  uart_puts("ALARME: nivel critico BAIXO\r\n");
+    if (novos & ALM_ALTO)   uart_puts("ALARME: nivel critico ALTO - bomba desligada\r\n");
+    if (novos & ALM_SENSOR) uart_puts("ALARME: falha no sensor - bomba desligada\r\n");
+    if (novos & ALM_ABAST)  uart_puts("ALARME: falha de abastecimento - bomba bloqueada (use R)\r\n");
+    if (alarmes == 0)       uart_puts("Alarmes normalizados\r\n");
+
+    alarmes_ant = alarmes;
+}
+
+static void processa_amostra(void)
+{
+    uint8_t bomba_ant = bomba;
+
+    if (adc_local <= ADC_MIN)      nivel = 0;
+    else if (adc_local >= ADC_MAX) nivel = 100;
+    else nivel = (int16_t)(((int32_t)(adc_local - ADC_MIN) * 100L) / (ADC_MAX - ADC_MIN));
+
+    alarmes &= ALM_ABAST;
+    if (adc_local < ADC_FALHA_BAIXO || adc_local > ADC_FALHA_ALTO) alarmes |= ALM_SENSOR;
+    else {
+        if (nivel <= NIVEL_CRIT_BAIXO) alarmes |= ALM_BAIXO;
+        if (nivel >= NIVEL_CRIT_ALTO)  alarmes |= ALM_ALTO;
+    }
+
+    if (alarmes & (ALM_SENSOR | ALM_ALTO | ALM_ABAST)) {
+        bomba = 0;
+    } else if (modo_auto) {
+        if (nivel <= nivel_liga)         bomba = 1;
+        else if (nivel >= nivel_desliga) bomba = 0;
+    } else {
+        bomba = bomba_manual;
+    }
+
+    if (bomba && !bomba_ant) {
+        pump_ticks = 0;
+        nivel_ref  = nivel;
+    }
+
+    aplica_saidas();
+    informa_alarmes();
+}
+
+static void processa_tick(void)
+{
+    static uint8_t ocioso = 0;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        if (!cmd_ready && cmd_idx > 0) {
+            if (++ocioso >= 3) {
+                cmd_buf[cmd_idx] = '\0';
+                cmd_idx = 0;
+                cmd_ready = 1;
+                ocioso = 0;
+            }
+        } else {
+            ocioso = 0;
+        }
+    }
+
+    if (bomba) {
+        pump_ticks++;
+        if (pump_ticks >= (uint16_t)TIMEOUT_BOMBA_S * 10) {
+            if ((nivel - nivel_ref) < SUBIDA_MIN_PCT) {
+                alarmes |= ALM_ABAST;
+                bomba = 0;
+                aplica_saidas();
+                informa_alarmes();
+            } else {
+                pump_ticks = 0;
+                nivel_ref  = nivel;
+            }
+        }
+    } else {
+        pump_ticks = 0;
+    }
+
+    if (++status_ticks >= 10) {
+        status_ticks = 0;
+        imprime_status();
+    }
+}
+
+static void trata_comando(const char *cmd)
+{
+    int v;
+
+    if (strcmp(cmd, "S") == 0) {
+        imprime_status();
+    } else if (strcmp(cmd, "H") == 0) {
+        uart_puts("S, ON=n, OFF=n, A, M, P1, P0, R\r\n");
+    } else if (strncmp(cmd, "ON=", 3) == 0) {
+        v = atoi(cmd + 3);
+        if (v >= 0 && v < nivel_desliga) { nivel_liga = v; uart_puts("OK\r\n"); }
+        else uart_puts("ERRO: ON deve ser < OFF\r\n");
+    } else if (strncmp(cmd, "OFF=", 4) == 0) {
+        v = atoi(cmd + 4);
+        if (v <= 100 && v > nivel_liga) { nivel_desliga = v; uart_puts("OK\r\n"); }
+        else uart_puts("ERRO: OFF deve ser > ON e <= 100\r\n");
+    } else if (strcmp(cmd, "A") == 0) {
+        modo_auto = 1; uart_puts("Modo AUTOMATICO\r\n");
+    } else if (strcmp(cmd, "M") == 0) {
+        modo_auto = 0; bomba_manual = bomba; uart_puts("Modo MANUAL\r\n");
+    } else if (strcmp(cmd, "P1") == 0 || strcmp(cmd, "P0") == 0) {
+        if (!modo_auto) { bomba_manual = (cmd[1] == '1'); uart_puts("OK\r\n"); }
+        else uart_puts("ERRO: use o modo manual (M)\r\n");
+    } else if (strcmp(cmd, "R") == 0) {
+        alarmes &= ~ALM_ABAST; pump_ticks = 0; uart_puts("Falha de abastecimento limpa\r\n");
+    } else {
+        uart_puts("ERRO: comando invalido (H para ajuda)\r\n");
+    }
+}
+
+void setup(void)
+{
+    gpio_init();
+    uart_init();
+    adc_init();
+    timer1_init();
+    sei();
+
+    uart_puts("Controle de nivel iniciado (H para ajuda)\r\n");
+}
+
+void loop(void)
+{
+    char cmd_local[16];
+
+    if (flag_adc) {
+        ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+            adc_local = adc_val;
+            flag_adc  = 0;
+        }
+        processa_amostra();
+    }
+
+    if (flag_tick) {
+        flag_tick = 0;
+        processa_tick();
+    }
+
+    if (cmd_ready) {
+        ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+            strncpy(cmd_local, (const char *)cmd_buf, sizeof(cmd_local));
+            cmd_local[sizeof(cmd_local) - 1] = '\0';
+            cmd_ready = 0;
+        }
+        trata_comando(cmd_local);
+    }
+}
